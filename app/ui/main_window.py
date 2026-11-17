@@ -59,6 +59,7 @@ from app.rendering.sweep_view import PLOT_STYLES, draw_sweep_view
 from app.rendering.verdict_style import colorize_verdict_html
 
 from .qtutil import _app_font, _primary_screen_geometry
+from .sweep_playback import SweepPlaybackDialog
 from .widgets import (
     ClickableImageLabel,
     ImageViewerDialog,
@@ -169,9 +170,9 @@ class MainWindow(QMainWindow):
         self.current_model_path = ""
         self._orig_pixmap = None
         self._settings = QSettings("HAILPVS", "HAILPVS")
-        self._plot_style = self._settings.value("drawing/style", "overview", type=str)
+        self._plot_style = self._settings.value("drawing/style", "classic", type=str)
         if self._plot_style not in PLOT_STYLES:
-            self._plot_style = "overview"
+            self._plot_style = "classic"
 
     # ================= 菜单 =================
     def init_menu(self):
@@ -317,10 +318,10 @@ class MainWindow(QMainWindow):
         title.addWidget(self.lbl_status)
         title.addStretch(1)
         self.btn_preview = QPushButton()
-        self._update_preview_label()
         self.btn_preview.clicked.connect(self.open_image_viewer)
         self.btn_save_img = QPushButton("保存 PNG")
         self.btn_save_img.clicked.connect(self.save_sweep_img)
+        self._update_plot_controls()
         title.addWidget(self.btn_preview)
         title.addWidget(self.btn_save_img)
         layout.addLayout(title)
@@ -669,12 +670,14 @@ class MainWindow(QMainWindow):
             return
         self._plot_style = style
         self._settings.setValue("drawing/style", style)
-        self._update_preview_label()
+        self._update_plot_controls()
         if self.cur_result is not None:
             self._render_sweep_preview()
 
-    def _update_preview_label(self):
-        self.btn_preview.setText("旋转查看" if self._plot_style == "3d" else "放大")
+    def _update_plot_controls(self):
+        labels = {"classic": "放大", "3d": "旋转查看", "playback": "打开回放"}
+        self.btn_preview.setText(labels[self._plot_style])
+        self.btn_save_img.setVisible(self._plot_style != "playback")
 
     def _render_sweep_preview(self):
         self._orig_pixmap = None
@@ -692,8 +695,9 @@ class MainWindow(QMainWindow):
         else:
             self._orig_pixmap = pm
             self.img_label.set_preview(pm)
-            self.btn_preview.setEnabled(True)
-            self.btn_save_img.setEnabled(True)
+            playback = self._plot_style == "playback"
+            self.btn_preview.setEnabled(not playback or len(self.cur_result.playback_frames) > 1)
+            self.btn_save_img.setEnabled(not playback)
 
     def _render_result(self, res):
         sections, html = [], []
@@ -747,6 +751,8 @@ class MainWindow(QMainWindow):
 
     # ================= 图片操作 =================
     def save_sweep_img(self):
+        if self._plot_style == "playback":
+            return
         if self._orig_pixmap is None:
             QMessageBox.information(self, "提示", "请先运行检验生成扫掠图。")
             return
@@ -761,6 +767,10 @@ class MainWindow(QMainWindow):
             return
         if self._plot_style == "3d":
             dialog = Sweep3DDialog(self.cur_result, self)
+        elif self._plot_style == "playback":
+            if len(self.cur_result.playback_frames) < 2:
+                return
+            dialog = SweepPlaybackDialog(self.cur_result, self)
         else:
             dialog = ImageViewerDialog(self._orig_pixmap, self)
         try:
@@ -895,7 +905,7 @@ class MainWindow(QMainWindow):
                                               "Word 文档 (*.docx)")
         if path:
             try:
-                assemble_and_save(res, path, plot_style=self._plot_style)
+                assemble_and_save(res, path)
                 QMessageBox.information(self, "导出成功", f"报告已生成：{path}")
             except Exception as e:
                 QMessageBox.warning(self, "导出失败", f"{e}")

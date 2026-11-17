@@ -169,29 +169,101 @@ def test_plot_style_switch_refreshes_the_png_and_persists(monkeypatch, tmp_path)
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     settings_path = str(tmp_path / "drawing.ini")
     monkeypatch.setattr(main_window, "QSettings", lambda *_: QSettings(settings_path, QSettings.IniFormat))
+    old_settings = QSettings(settings_path, QSettings.IniFormat)
+    old_settings.setValue("drawing/style", "overview")
+    old_settings.sync()
     app = QApplication.instance() or QApplication([])
     window = main_window.MainWindow()
     example = next(Path(__file__).resolve().parents[1].glob("示例1_*.model"))
     png_path = tmp_path / "selected-style.png"
     monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args: (str(png_path), ""))
     try:
+        actions = {action.data(): action for action in window._style_actions.actions()}
+        assert [action.text() for action in actions.values()] == [
+            "原版详细标注图", "三维展示图", "扫掠回放图"
+        ]
+        assert actions["classic"].isChecked()
         window.unpack_model_data(load_model(example))
         window.run_calc()
         result = window.cur_result
         window.save_sweep_img()
-        overview_png = png_path.read_bytes()
-        classic = next(a for a in window._style_actions.actions() if a.data() == "classic")
-        classic.trigger()
-        assert window.cur_result is result and classic.isChecked()
+        original_png = png_path.read_bytes()
+        actions["3d"].trigger()
+        assert window.cur_result is result and actions["3d"].isChecked()
         window.save_sweep_img()
-        assert png_path.read_bytes() != overview_png
+        three_d_png = png_path.read_bytes()
+        assert three_d_png != original_png
+
+        actions["playback"].trigger()
+        assert window.btn_preview.isEnabled() and window.btn_preview.text() == "打开回放"
+        assert window.btn_save_img.isHidden() and not window.btn_save_img.isEnabled()
+        window.save_sweep_img()
+        assert png_path.read_bytes() == three_d_png
         window._settings.sync()
 
         reopened = main_window.MainWindow()
         try:
-            assert reopened._style_actions.checkedAction().data() == "classic"
+            assert reopened._style_actions.checkedAction().data() == "playback"
         finally:
             reopened.close()
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_playback_seeks_by_distance_and_time_through_saved_frames(monkeypatch, tmp_path):
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtTest import QTest
+
+    from app.ui.sweep_playback import SweepPlaybackDialog
+
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    monkeypatch.setattr(main_window, "QSettings", lambda *_: QSettings(
+        str(tmp_path / "playback.ini"), QSettings.IniFormat))
+    app = QApplication.instance() or QApplication([])
+    window = main_window.MainWindow()
+    example = next(Path(__file__).resolve().parents[1].glob("示例4_*.model"))
+    window.unpack_model_data(load_model(example))
+    window.run_calc()
+    result = window.cur_result
+    next(action for action in window._style_actions.actions() if action.data() == "playback").trigger()
+
+    def inspect_player(player):
+        assert player.frames is result.playback_frames
+        assert len(player.frames) > len(result.vehicle_frames)
+        player.next.click()
+        assert player.index == 1
+        player.progress.setValue(5000)
+        assert player.distances[player.index] == pytest.approx(player.length / 2, abs=0.15)
+        player.show()
+        field = player.seek_time.lineEdit()
+        field.setFocus()
+        field.selectAll()
+        QTest.keyClicks(field, "10.00")
+        QTest.keyClick(field, Qt.Key_Return)
+        assert player.distances[player.index] == pytest.approx(15.0, abs=0.15)
+        assert not player.timer.isActive()
+        player.seek_time.setValue(player.seek_time.maximum())
+        assert player.index == len(player.frames) - 1
+        player.play.click()
+        assert player.index == 0 and player.timer.isActive()
+        player.accept()
+        assert not player.timer.isActive()
+
+    opened = []
+
+    def inspect_dialog(player):
+        inspect_player(player)
+        opened.append(True)
+
+    monkeypatch.setattr(SweepPlaybackDialog, "exec_", inspect_dialog)
+    try:
+        assert window.btn_preview.isEnabled()
+        window.open_image_viewer()
+        assert opened == [True]
+        assert window.cur_result is result
+        window.action_clear_result()
+        assert not window.btn_preview.isEnabled()
     finally:
         window.close()
         app.processEvents()

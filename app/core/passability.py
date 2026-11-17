@@ -127,6 +127,7 @@ class SweepScenarioResult:
         self.swept = None               # shapely 扫掠区域
         self.cargo_sweep = None         # 外伸货物的独立扫掠区域
         self.travel_path = []           # 仿真参考点，按行驶顺序排列
+        self.playback_frames = []       # 本次仿真的完整姿态序列
         self.hydraulic = False
         self.vehicle_overrun = None     # shapely 车辆扫掠越界区域
         self.cargo_overrun = None       # shapely 货物扫掠越界区域
@@ -558,6 +559,7 @@ def run_arc_scene(bundle: InputBundle) -> SweepScenarioResult:
     res.swept = swept
     res.hydraulic = hydraulic
     res.travel_path = [(x, y) for x, y, *_ in vgeoms]
+    res.playback_frames = vgeoms
     # 圆弧弯道绘图姿态：入弯前直行 1 + 弯道内 2 + 完全出弯后直行 1 = 4 辆
     # （下标 0 恒为"入弯前"那辆，车/货长宽尺寸标注画在它上面）
     res.vehicle_frames = _pick_arc_poses(vgeoms, _TURN_DEG, center)
@@ -1012,6 +1014,7 @@ def run_right_angle_scene(bundle: InputBundle) -> SweepScenarioResult:
     res.swept = split["swept"]
     res.hydraulic = hydraulic
     res.travel_path = [(x, y) for x, y, *_ in vgeoms]
+    res.playback_frames = vgeoms
     if bundle.cargo.width > bundle.trailer.width or bundle.cargo.length > bundle.trailer.length:
         res.cargo_sweep = split["cargo_sweep"]
     res.vehicle_overrun = split["vehicle_overrun"]

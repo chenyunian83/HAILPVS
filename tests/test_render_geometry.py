@@ -105,6 +105,22 @@ def _failing_lookup_bundle():
         max_speed_kmh=10.0)
 
 
+@pytest.mark.parametrize("plot_style", ["3d", "playback"])
+def test_word_report_always_uses_original_static_drawing(tmp_path, plot_style):
+    from io import BytesIO
+    from zipfile import ZipFile
+
+    from app.rendering.report_assembler import assemble_and_save
+    from app.rendering.sweep_view import draw_sweep_view
+
+    result = run_scene(_failing_lookup_bundle())
+    path = tmp_path / "report.docx"
+    assemble_and_save(result, path, plot_style=plot_style)
+    with BytesIO() as original, ZipFile(path) as report:
+        draw_sweep_view(result, original, style="classic")
+        assert report.read("word/media/image1.png") == original.getvalue()
+
+
 def test_word_report_no_run_mixes_verdict_polarity():
     # Word 报告的每个 run 不得同时含"满足"与"不通过"，且含"不通过"的 run 不得为绿色
     docx = pytest.importorskip("docx")

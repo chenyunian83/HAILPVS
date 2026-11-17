@@ -102,7 +102,7 @@ def _add_formula_para(doc, text, size=12, bold=False):
 
 
 def assemble_and_save(res: SweepScenarioResult, out_path, *, plot_style="classic"):
-    """按检验结果生成 Word 报告并保存。"""
+    """生成 Word 报告；保留旧的 plot_style 参数，报告始终使用原版详细图。"""
     doc = Document()
 
     title = doc.add_heading("", level=0)
@@ -165,7 +165,7 @@ def assemble_and_save(res: SweepScenarioResult, out_path, *, plot_style="classic
     h4 = doc.add_heading("", level=1)
     h4r = h4.add_run("四、弯道扫掠轨迹图")
     set_font_kai(h4r, 14, bold=True)
-    img_path = _render_img(res, plot_style)
+    img_path = _render_img(res)
     if img_path:
         try:
             doc.add_picture(img_path, width=Inches(6.2))
@@ -233,7 +233,7 @@ def _assemble_meta(res: SweepScenarioResult):
     return {"params": params}
 
 
-def _render_img(res, plot_style):
+def _render_img(res):
     """把扫掠图渲染为临时 PNG 供 Word 内嵌。
 
     仅捕获"渲染不可用"类异常（缺依赖/后端问题）；程序性错误（如 KeyError）
@@ -243,7 +243,7 @@ def _render_img(res, plot_style):
         fd = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
         path = fd.name
         fd.close()
-        draw_sweep_view(res, path, style=plot_style)
+        draw_sweep_view(res, path, style="classic")
         return path
     except (ImportError, OSError, RuntimeError, ValueError) as exc:
         print(f"[报告] 扫掠图渲染失败：{type(exc).__name__}: {exc}")
