@@ -211,6 +211,109 @@ def test_plot_style_switch_refreshes_the_png_and_persists(monkeypatch, tmp_path)
         app.processEvents()
 
 
+def test_playback_keeps_annotations_clear_of_the_road_after_switching_to_hydraulic(monkeypatch):
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.text import Text
+    from mpl_toolkits.axes_grid1.anchored_artists import AnchoredSizeBar
+
+    from app.core.passability import run_scene
+    from app.rendering.sweep_view import build_figure
+
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    app = QApplication.instance() or QApplication([])
+    window = main_window.MainWindow()
+    try:
+        example = next(Path(__file__).resolve().parents[1].glob("示例3_*.model"))
+        window.unpack_model_data(load_model(example))
+        window.cmb_trailer_type.setCurrentText("液压轴线挂车")
+        result = run_scene(window.collect_bundle())
+        assert result.hydraulic
+        fig, ax = build_figure(result, style="playback")
+        scale, = fig.findobj(AnchoredSizeBar)
+        note, = [t for t in fig.findobj(Text) if "稳态净空" in t.get_text() and "要求" in t.get_text()]
+        canvas = FigureCanvasAgg(fig)
+        for size in ((12, 9), (6.4, 4)):
+            fig.set_size_inches(*size)
+            canvas.draw()
+            renderer = canvas.get_renderer()
+            scale_box = scale.get_window_extent(renderer)
+            note_box = note.get_window_extent(renderer)
+            legend_box = fig.legends[0].get_window_extent(renderer)
+            assert max(scale_box.ymax, note_box.ymax) < ax.bbox.ymin
+            assert legend_box.ymax < min(scale_box.ymin, note_box.ymin)
+            assert not scale_box.overlaps(note_box)
+            meters = float(scale.txt_label.get_children()[0].get_text().split()[0])
+            bar, = scale.size_bar.get_children()
+            expected_width = abs(ax.transData.transform((meters, 0))[0] - ax.transData.transform((0, 0))[0])
+            assert bar.get_window_extent(renderer).width == pytest.approx(expected_width)
+    finally:
+        window.close()
+        app.processEvents()
+
+
+@pytest.mark.parametrize("example_number", [3, 4])
+def test_calculation_link_opens_the_critical_frame_with_turn_markers(monkeypatch, tmp_path, example_number):
+    from PyQt5.QtCore import Qt, QUrl
+    from PyQt5.QtTest import QTest
+    from PyQt5.QtWidgets import QPushButton
+
+    from app.ui.sweep_playback import SweepPlaybackDialog
+
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    monkeypatch.setattr(main_window, "QSettings", lambda *_: QSettings(
+        str(tmp_path / "replay-link.ini"), QSettings.IniFormat))
+    app = QApplication.instance() or QApplication([])
+    window = main_window.MainWindow()
+    try:
+        example = next(Path(__file__).resolve().parents[1].glob(f"示例{example_number}_*.model"))
+        window.unpack_model_data(load_model(example))
+        if example_number == 3:
+            window.cmb_trailer_type.setCurrentText("液压轴线挂车")
+        else:
+            window._right_edits["exit_width"].setText("3")
+        window.run_calc()
+        result = window.cur_result
+        clearance = result.playback_clearance
+        assert window._plot_style == "classic"
+        assert "replay:minimum" in window.text_result.toHtml()
+        assert f"全程回放最小间距 {clearance.meters:.3f} m" in window.text_result.toPlainText()
+        if example_number == 3:
+            assert "稳态最小净空" in window.text_result.toPlainText()
+            assert clearance.meters > 0
+        else:
+            assert "replay:invasion" in window.text_result.toHtml()
+            assert clearance.meters < 0
+        opened = []
+
+        def inspect_dialog(player):
+            opened.append(player.index)
+            entry, exit_ = result.playback_turn_frames
+            assert 0 < entry < exit_ < len(player.frames) - 1
+            assert player.distances[entry] == pytest.approx(6.0)
+            assert len(player.progress.markers) == 3
+            player.findChild(QPushButton, "Replay-entry").click()
+            assert player.index == entry
+            player.show()
+            app.processEvents()
+            _, exit_marker, _ = next(row for row in player.progress._marker_positions() if row[0] == "exit")
+            assert player.progress.rect().contains(exit_marker)
+            QTest.mouseClick(player.progress, Qt.LeftButton, pos=exit_marker)
+            assert player.index == exit_
+            player.findChild(QPushButton, "Replay-minimum").click()
+            assert player.index == clearance.frame
+            player.accept()
+
+        monkeypatch.setattr(SweepPlaybackDialog, "exec_", inspect_dialog)
+        window.text_result.anchorClicked.emit(QUrl("replay:minimum"))
+        assert opened == [clearance.frame]
+        window.action_clear_result()
+        window.text_result.anchorClicked.emit(QUrl("replay:minimum"))
+        assert opened == [clearance.frame]
+    finally:
+        window.close()
+        app.processEvents()
+
+
 def test_playback_seeks_by_distance_and_time_through_saved_frames(monkeypatch, tmp_path):
     from PyQt5.QtCore import Qt
     from PyQt5.QtTest import QTest

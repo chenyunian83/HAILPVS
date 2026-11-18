@@ -55,7 +55,7 @@ from app.core.datamodel import (
 )
 from app.core.passability import run_scene
 from app.model.project import ensure_suffix, load_model, save_model
-from app.rendering.sweep_view import PLOT_STYLES, draw_sweep_view
+from app.rendering.sweep_view import PLOT_STYLES, draw_sweep_view, right_angle_invasion
 from app.rendering.verdict_style import colorize_verdict_html
 
 from .qtutil import _app_font, _primary_screen_geometry
@@ -189,8 +189,6 @@ class MainWindow(QMainWindow):
         m_tool.addAction("清空检验结果", self.action_clear_result)
         m_tool.addSeparator()
         m_tool.addAction("检验方法说明", self.action_show_acceptance)
-        m_tool.addAction("切换全屏", self._toggle_fullscreen, QKeySequence("F11"))
-        m_tool.addAction("退出全屏", self._exit_fullscreen, QKeySequence("Esc"))
         m_style = bar.addMenu("设置(&S)").addMenu("画图风格")
         self._style_actions = QActionGroup(self)
         self._style_actions.setExclusive(True)
@@ -271,16 +269,6 @@ class MainWindow(QMainWindow):
         self.btn_export.clicked.connect(self.export_word)
         row.addWidget(self.btn_export)
         return header
-
-    def _toggle_fullscreen(self):
-        if self.isFullScreen():
-            self._exit_fullscreen()
-        else:
-            self.showFullScreen()
-
-    def _exit_fullscreen(self):
-        if self.isFullScreen():
-            self.showMaximized()
 
     def _build_inputs(self):
         panel, layout = self._panel("InputPanel", 284)
@@ -368,7 +356,9 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.process_sections)
         self.text_result = QTextBrowser()
         self.text_result.setObjectName("CalculationText")
+        self.text_result.setOpenLinks(False)
         self.text_result.setOpenExternalLinks(False)
+        self.text_result.anchorClicked.connect(self._open_playback_link)
         self.text_result.setWordWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
         self.text_result.setPlaceholderText("运行检验后查看公式、代入值和判定。")
         self.text_result.document().setDocumentMargin(5)
@@ -503,7 +493,7 @@ class MainWindow(QMainWindow):
         self.scenario_label.setText(f"{road_type}  /  {road_detail}  /  {self.cmb_trailer_type.currentText()}")
         top_name = "顶部净空间隙" if self.cmb_clearance_mode.currentData() == "obstacle" else "顶部净空"
         names = ("所需宽度", "最大侵入深度", top_name) if is_right_angle else (
-            "转弯通道宽度", "最小横向净空", top_name)
+            "转弯通道宽度", "最小稳态净空", top_name)
         values = (None, None, None)
         if self.cur_result is not None:
             metrics = self.cur_result.metrics
@@ -513,7 +503,8 @@ class MainWindow(QMainWindow):
                     metrics["vehicle_depth"], metrics["cargo_depth"])
             else:
                 width = metrics["turn_channel_w"]
-                horizontal = min(metrics["clearance_inner"], metrics["clearance_outer"])
+                horizontal = None if metrics["sim_unstable"] else min(
+                    metrics["clearance_inner"], metrics["clearance_outer"])
                 if metrics["lookup"] == "pass":
                     names = ("通道宽度（参考）", *names[1:])
             vertical = metrics["vertical_clearance_gap"]
@@ -708,6 +699,7 @@ class MainWindow(QMainWindow):
                 sections.append(title)
                 html.append(f"<h2 style='margin-top:16px;font-size:14pt;color:#18447d;'>"
                             f"<a name='{anchor}'>{title}</a></h2>")
+                html.extend(self._playback_result_links(res, title))
             else:
                 html.append(f"<p style='margin:0 0 6px;'>{colorize_verdict_html(line)}</p>")
         with QSignalBlocker(self.process_sections):
@@ -720,6 +712,31 @@ class MainWindow(QMainWindow):
             + "".join(html) + "</div>")
         self.process_sections.setEnabled(True)
         self._jump_to_step(self.process_sections.currentIndex())
+
+    @staticmethod
+    def _playback_result_links(res, title):
+        section = "宽度与横向净空" if res.scene == "arc" else "路口扫掠越界"
+        if title != section or len(res.playback_frames) < 2:
+            return []
+        links = []
+        if res.scene == "arc" and not res.metrics["sim_unstable"]:
+            meters = min(res.metrics["clearance_inner"], res.metrics["clearance_outer"])
+            links.append(f"<p>稳态最小净空 <b>{meters:.3f} m</b>（圆弧稳态校核）</p>")
+        clearance = res.playback_clearance
+        if clearance is not None:
+            links.append(f"<p><a href='replay:minimum'>全程回放最小间距 {clearance.meters:.3f} m"
+                         f" · {clearance.body}</a><br>回放参考值。从入弯前到出弯后逐帧量测，负值表示越界。</p>")
+        contact = right_angle_invasion(res)
+        if contact is not None:
+            body, depth, _, _ = contact
+            label = "车辆" if body == "vehicle" else "货物"
+            links.append(f"<p><a href='replay:invasion'>{label}校核侵入 {depth:.3f} m</a>"
+                         "（回放定位到最近采样帧）</p>")
+        return links
+
+    def _open_playback_link(self, url):
+        if url.scheme() == "replay" and url.path() in ("minimum", "invasion"):
+            self._open_playback(url.path())
 
     @staticmethod
     def _initial_process_section(res):
@@ -768,12 +785,23 @@ class MainWindow(QMainWindow):
         if self._plot_style == "3d":
             dialog = Sweep3DDialog(self.cur_result, self)
         elif self._plot_style == "playback":
-            if len(self.cur_result.playback_frames) < 2:
-                return
-            dialog = SweepPlaybackDialog(self.cur_result, self)
+            self._open_playback()
+            return
         else:
             dialog = ImageViewerDialog(self._orig_pixmap, self)
         try:
+            dialog.exec_()
+        finally:
+            dialog.deleteLater()
+
+    def _open_playback(self, event=None):
+        result = self.cur_result
+        if result is None or len(result.playback_frames) < 2:
+            return
+        dialog = SweepPlaybackDialog(result, self)
+        try:
+            if event is not None:
+                dialog.seek_event(event)
             dialog.exec_()
         finally:
             dialog.deleteLater()

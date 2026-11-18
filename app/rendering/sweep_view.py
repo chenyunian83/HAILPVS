@@ -16,7 +16,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
-from matplotlib.offsetbox import AnchoredText
 from matplotlib.patches import Arc, Patch
 from mpl_toolkits.axes_grid1.anchored_artists import AnchoredSizeBar
 
@@ -759,19 +758,12 @@ def _draw_travel_direction(ax, res):
                                     mutation_scale=18, shrinkA=0, shrinkB=0))
 
 
-def _overview_callout(ax, point, label, color):
-    xlo, xhi = ax.get_xlim()
-    ylo, yhi = ax.get_ylim()
-    dx = 16 if (point[0] - xlo) / (xhi - xlo) < 0.62 else -16
-    dy = 21 if point[1] < ylo + (yhi - ylo) * 0.67 else -22
-    ax.annotate(label, xy=point, xytext=(dx, dy), textcoords="offset points",
-                ha="left" if dx > 0 else "right", va="bottom" if dy > 0 else "top",
-                color=color, fontsize=13, family=_OV_FONT, zorder=11,
-                bbox=dict(boxstyle="round,pad=.35", fc="white", ec=color, lw=0.8),
-                arrowprops=dict(arrowstyle="-", color=color, lw=1.0))
+def _playback_note(fig, label, color):
+    fig.text(.945, .30, label, ha="right", va="center",
+             color=color, fontsize=13, family=_OV_FONT)
 
 
-def _overview_arc_clearance(ax, res):
+def _overview_arc_clearance(fig, ax, res):
     m = res.metrics
     if m["sim_unstable"]:
         return
@@ -790,8 +782,8 @@ def _overview_arc_clearance(ax, res):
     ax.plot((sweep[0], road[0]), (sweep[1], road[1]), color=color, lw=2.2,
             marker="o", markersize=3.8, zorder=9)
     edge = "内缘" if inner else "外缘"
-    _overview_callout(ax, road, f"{edge}稳态净空 {m[f'clearance_{side}']:.3f} m\n"
-                               f"要求 ≥ {m['sigma']:.2f} m", color)
+    _playback_note(fig, f"● {edge}稳态净空 {m[f'clearance_{side}']:.3f} m"
+                        f"  ·  要求 ≥ {m['sigma']:.2f} m", color)
 
 
 def right_angle_invasion(res):
@@ -804,7 +796,7 @@ def right_angle_invasion(res):
     return max(candidates, key=lambda item: (item[3], item[1]), default=None)
 
 
-def _overview_right_angle(ax, res):
+def _overview_right_angle(fig, ax, res):
     m = res.metrics
     handles = []
     for key, overrun in (("vehicle", res.vehicle_overrun), ("cargo", res.cargo_overrun)):
@@ -825,7 +817,8 @@ def _overview_right_angle(ax, res):
         ax.plot(*point, marker="D" if failed else "o", mfc="white", mec=color,
                 ms=6, mew=1.5, zorder=11)
         suffix = "" if failed else "（容差内）"
-        _overview_callout(ax, point, f"{label}最大侵入 {depth:.3f} m{suffix}", color)
+        marker = "◇" if failed else "○"
+        _playback_note(fig, f"{marker} {label}最大侵入 {depth:.3f} m{suffix}", color)
     return handles
 
 
@@ -880,7 +873,7 @@ def _overview_footer(fig, res):
 def build_playback_figure(res, figsize=(12, 9)):
     """绘制静态道路和全程扫掠底图，供回放叠加当前姿态。"""
     fig = Figure(figsize=figsize, facecolor="white")
-    ax = fig.add_axes((0.05, 0.24, 0.90, 0.65))
+    ax = fig.add_axes((0.05, 0.35, 0.90, 0.54))
     ax.set_aspect("equal", "box")
     ax.set_axis_off()
     m = res.metrics
@@ -921,20 +914,21 @@ def build_playback_figure(res, figsize=(12, 9)):
     if m.get("turn_direction") == "右转":
         ax.invert_xaxis()
     if res.scene == "arc":
-        _overview_arc_clearance(ax, res)
+        _overview_arc_clearance(fig, ax, res)
     elif m.get("split_error"):
-        note = AnchoredText("扫掠越界校核未完成", loc="upper left", frameon=False,
-                            prop=dict(family=_OV_FONT, color=OVERRUN_COLOR, size=13))
-        ax.add_artist(note)
+        _playback_note(fig, "扫掠越界校核未完成", OVERRUN_COLOR)
     else:
-        handles += _overview_right_angle(ax, res)
+        handles += _overview_right_angle(fig, ax, res)
     span = max(x1 - x0, y1 - y0)
-    scale = 20 if span >= 100 else 10 if span >= 50 else 5
-    ax.add_artist(AnchoredSizeBar(ax.transData, scale, f"{scale} m", "lower left",
-                                  pad=.4, sep=4, frameon=False, color=_OV_INK,
-                                  fontproperties=dict(family=_OV_FONT, size=12)))
-    fig.legend(handles=handles, loc="lower left", bbox_to_anchor=(.049, .157),
-               ncol=min(len(handles), 6), frameon=False, prop=dict(family=_OV_FONT, size=12))
+    scale = next((length for length in (20, 10, 5, 2) if length <= span / 5), 1)
+    # 比例尺随地图的米制比例缩放，但固定在图外，任何姿态都不会被遮挡。
+    fig.add_artist(AnchoredSizeBar(ax.transData, scale, f"{scale} m", "center left",
+                                   bbox_to_anchor=(.055, .30), bbox_transform=fig.transFigure,
+                                   pad=0, borderpad=0, sep=4, frameon=False, color=_OV_INK,
+                                   fontproperties=dict(family=_OV_FONT, size=12)))
+    fig.legend(handles=handles, loc="upper left", bbox_to_anchor=(.055, .254),
+               ncol=4, frameon=False, prop=dict(family=_OV_FONT, size=11),
+               borderaxespad=0, borderpad=0, labelspacing=.35, columnspacing=1.3)
     fig.add_artist(Line2D([.055, .945], [.147, .147], transform=fig.transFigure,
                           color="#d5e0ed", lw=1.0))
     _overview_footer(fig, res)

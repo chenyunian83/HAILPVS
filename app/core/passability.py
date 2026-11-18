@@ -10,9 +10,11 @@
 """
 from __future__ import annotations
 import math
+from dataclasses import dataclass
 
-from shapely.geometry import MultiPolygon
-from shapely.ops import unary_union
+from shapely.geometry import MultiPolygon, Point
+from shapely.ops import nearest_points, unary_union
+from shapely.prepared import prep
 
 from config import (TURN_SAFE_CLEARANCE, TURN_SAFE_CLEARANCE_B12,
                     LATERAL_CLEARANCE_BY_GRADE,
@@ -119,6 +121,15 @@ def _pick_curve_poses(vgeoms, turn_deg, center=(0.0, 0.0), n=2):
             for k in range(n)]
 
 
+@dataclass(frozen=True)
+class PlaybackClearance:
+    frame: int
+    meters: float
+    body: str
+    body_point: tuple[float, float]
+    road_point: tuple[float, float]
+
+
 class SweepScenarioResult:
     """一次检验的完整结果。"""
     def __init__(self):
@@ -128,6 +139,8 @@ class SweepScenarioResult:
         self.cargo_sweep = None         # 外伸货物的独立扫掠区域
         self.travel_path = []           # 仿真参考点，按行驶顺序排列
         self.playback_frames = []       # 本次仿真的完整姿态序列
+        self.playback_turn_frames = ()  # 参考点开始、结束转向的帧
+        self.playback_clearance = None   # 全程采样帧的最小路缘间距，供回放定位
         self.hydraulic = False
         self.vehicle_overrun = None     # shapely 车辆扫掠越界区域
         self.cargo_overrun = None       # shapely 货物扫掠越界区域
@@ -418,7 +431,7 @@ def _road_from_centerline(r_center, half_widths, turn_deg, straight=_ROAD_STRAIG
                         exit_.buffer(w_out, cap_style=2)])
 
 
-def _build_arc_display(bundle, r_path, delta_used):
+def _build_arc_display(bundle, r_path, delta_used, turn_frames):
     """生成圆弧轨迹用于绘图：沿切入向直道入场 → 在弧起点(角度0)处绕圆心 O
     逆时针转 _TURN_DEG（与稳态量测同圆心）→ 沿末端切向直道出场。"""
     kin = TractorTrailerKinematics(bundle)
@@ -429,7 +442,10 @@ def _build_arc_display(bundle, r_path, delta_used):
     turn_steps = int(math.radians(_TURN_DEG) / (ang_vel * _DT))
     profile.append((turn_steps, delta_used))               # 绕 O 转 _TURN_DEG
     profile.append((math.ceil(_departure_length(bundle) / (_V * _DT)), 0.0))
-    frames, _k = run_profile(kin, profile, v=_V, dt=_DT, draw_step=2, include_boundaries=True)
+    phase_ends = []
+    frames, _k = run_profile(kin, profile, v=_V, dt=_DT, draw_step=2,
+                             include_boundaries=True, phase_ends=phase_ends)
+    turn_frames.extend(phase_ends[:2])
     vgeoms = build_trajectory_geoms(kin, frames, sample_rate=1)
     swept = polylist_to_multipoly(vgeoms)
     return vgeoms, swept
@@ -462,6 +478,7 @@ def run_arc_scene(bundle: InputBundle) -> SweepScenarioResult:
     trajectory_source = "铰接尾随"
     sim_unstable = False          # 铰接尾随模型是否超出适用前提（车板长 ≥ 走行半径）
     steering_ok = True
+    turn_frames = []
     if hydraulic:
         # —— 液压轴线挂车（B.1.2 闭式解口径）——
         # θ 由实际弯道半径反算(D9)：使瞬心偏距 base ≡ r_veh、R_min 恒为正，
@@ -475,7 +492,8 @@ def run_arc_scene(bundle: InputBundle) -> SweepScenarioResult:
         # 内/外缘预留（4.2.1）按"仅板车+货物"刚体扫空几何量测，不并入牵引车。
         r_o, r_i = hydraulic_rigid_sweep_radii(bundle, r_veh)
         vgeoms, swept = hydraulic_arc_trajectory(bundle, b12, r_veh, _TURN_DEG, max_step=_SWEEP_STEP,
-                                                  exit_straight=_departure_length(bundle))
+                                                 exit_straight=_departure_length(bundle),
+                                                 turn_frames=turn_frames)
     else:
         # —— 稳态量测（B.1.1 机械挂车：绕道路圆心 O 的铰接尾随仿真）——
         kin.reset_pose(r_path, 0.0, math.radians(90))
@@ -492,7 +510,7 @@ def run_arc_scene(bundle: InputBundle) -> SweepScenarioResult:
         wheel_outer = math.hypot(r_path + tractor_track / 2.0, kin.wheelbase)
         wheel_radii = wheel_inner, wheel_outer
         turn_channel_w = wheel_outer - wheel_inner + TURN_SAFE_CLEARANCE
-        vgeoms, swept = _build_arc_display(bundle, r_path, delta_used)
+        vgeoms, swept = _build_arc_display(bundle, r_path, delta_used, turn_frames)
         # 铰接尾随模型的有效前提：车板长 < 走行半径。否则车尾会越过转弯圆心，
         # 尾随点绕圆心反向绕行，R_o/R_i 变成无物理意义的数值（该工况实际已不可能通过）。
         sim_unstable = r_path <= kin.loop_len
@@ -560,6 +578,12 @@ def run_arc_scene(bundle: InputBundle) -> SweepScenarioResult:
     res.hydraulic = hydraulic
     res.travel_path = [(x, y) for x, y, *_ in vgeoms]
     res.playback_frames = vgeoms
+    res.playback_turn_frames = tuple(turn_frames)
+    if not sim_unstable and steering_ok:
+        measurement_road = _road_from_centerline(
+            r_target, (lane / 2.0,) * 3, _TURN_DEG,
+            straight=_playback_road_length(bundle, lane, abs(r_veh - r_target)))
+        res.playback_clearance = _measure_playback_clearance(vgeoms, measurement_road)
     # 圆弧弯道绘图姿态：入弯前直行 1 + 弯道内 2 + 完全出弯后直行 1 = 4 辆
     # （下标 0 恒为"入弯前"那辆，车/货长宽尺寸标注画在它上面）
     res.vehicle_frames = _pick_arc_poses(vgeoms, _TURN_DEG, center)
@@ -805,13 +829,14 @@ def _simulate_right_angle(bundle, turn_deg, r_path, corner_xy, max_step):
     turn_rad = math.radians(turn_deg)
     cx, cy = _ra_turn_center(corner_xy, r_path, turn_deg)
     exit_straight = _departure_length(bundle)
+    turn_frames = []
 
     if _is_hydraulic(bundle):
         b12 = hydraulic_turn_radii(bundle, actual_turn_radius=r_path)
         vgeoms, _ = hydraulic_arc_trajectory(
             bundle, b12, r_path, turn_deg, center=(cx, cy), max_step=max_step,
-            include_envelope=False, exit_straight=exit_straight)
-        return vgeoms
+            include_envelope=False, exit_straight=exit_straight, turn_frames=turn_frames)
+        return vgeoms, tuple(turn_frames)
 
     delta_rec = min(kin.max_delta, math.atan(kin.wheelbase / r_path))
     kin.reset_pose(corner_xy[0], cy - _STRAIGHT, math.radians(90))
@@ -822,9 +847,10 @@ def _simulate_right_angle(bundle, turn_deg, r_path, corner_xy, max_step):
                             (exit_straight / _V, 0.0)):
         count = math.ceil(duration / max_dt)
         profile.append((count, delta, duration / count))
+    phase_ends = []
     frames, _ = run_profile(kin, profile, v=_V, draw_step=max(1, round(max_step / (_V * max_dt))),
-                            include_boundaries=True)
-    return build_trajectory_geoms(kin, frames)
+                            include_boundaries=True, phase_ends=phase_ends)
+    return build_trajectory_geoms(kin, frames), tuple(phase_ends[:2])
 
 
 _SWEPT_OVERRUN_TOL = 0.10      # 工程数值容差面积(m²)
@@ -851,7 +877,7 @@ def _ra_best_radius(bundle, turn_deg, road_poly, corner_xy, cands, width_limit, 
     best = None
     for radius in reversed(cands):
         step = _SWEEP_STEP
-        frames = _simulate_right_angle(bundle, turn_deg, radius, corner_xy, step)
+        frames, turn_frames = _simulate_right_angle(bundle, turn_deg, radius, corner_xy, step)
         split = _swept_inside_road(frames, road_poly)
         area = max(split["vehicle_outside"], split["cargo_outside"])
         depth = max(split["vehicle_depth"], split["cargo_depth"])
@@ -861,7 +887,7 @@ def _ra_best_radius(bundle, turn_deg, road_poly, corner_xy, cands, width_limit, 
             for _ in range(2):
                 previous = split
                 step /= 2
-                frames = _simulate_right_angle(bundle, turn_deg, radius, corner_xy, step)
+                frames, turn_frames = _simulate_right_angle(bundle, turn_deg, radius, corner_xy, step)
                 split = _swept_inside_road(frames, road_poly)
                 area = max(split["vehicle_outside"], split["cargo_outside"])
                 if split["error"] or all(
@@ -873,7 +899,7 @@ def _ra_best_radius(bundle, turn_deg, road_poly, corner_xy, cands, width_limit, 
                     break
             else:
                 split.update(vehicle_ok=False, cargo_ok=False, error="临界位置加密后未达到收敛要求")
-        result = radius, frames, split, step
+        result = radius, frames, split, step, turn_frames
         if split["vehicle_ok"] and split["cargo_ok"]:
             outer, inner = _ra_sweep_radii(
                 bundle, radius, _ra_turn_center(corner_xy, radius, turn_deg))
@@ -891,8 +917,6 @@ def _ra_best_radius(bundle, turn_deg, road_poly, corner_xy, cands, width_limit, 
 
 def _overrun_depth(poly, road):
     """在越界区域的边界顶点上量测最大侵入深度和所在位置。"""
-    from shapely.geometry import Point
-
     if poly is None or poly.is_empty or road is None:
         return 0.0, None
     rings = ([poly.exterior] if poly.geom_type == "Polygon"
@@ -904,6 +928,43 @@ def _overrun_depth(poly, road):
             if dist > depth:
                 depth, position = dist, (x, y)
     return depth, position
+
+
+def _playback_road_length(bundle, width, path_offset):
+    """量测用直道外延，避免把示意图截断端头算作路缘。"""
+    reach = max(bundle.trailer.length, bundle.cargo.length, bundle.tractor.wheelbase + 1)
+    return max(_ROAD_STRAIGHT, _departure_length(bundle) + reach + width + path_offset + _STRAIGHT)
+
+
+def _measure_playback_clearance(frames, road):
+    """在保存的姿态上量测各外廓到路缘的最小间距，越界时取负的采样侵入深度。"""
+    if road.is_empty or not road.is_valid:
+        return None
+    boundary = road.boundary
+    coverage = prep(road)
+    best = None
+    for index, frame in enumerate(frames):
+        _, _, envelope, deck, cargo = frame[:5]
+        bodies = [("车板", deck), ("货物", cargo)]
+        if envelope.geom_type == "MultiPolygon":
+            bodies.append(("牵引车", envelope.geoms[-1]))
+        for body, shape in bodies:
+            if coverage.covers(shape):
+                meters = shape.distance(boundary)
+                start_geometry = shape
+            else:
+                outside = shape.difference(road)
+                if outside.is_empty:
+                    continue
+                depth, point = _overrun_depth(outside, road)
+                # 当外侧区域跨过凹角但顶点都落在路缘时，仍取区内点量测。
+                start_geometry = Point(point) if point is not None else outside.representative_point()
+                meters = -depth if point is not None else -start_geometry.distance(road)
+            # 对相同间距保留先出现的姿态，避免几何舍入把标记跳到另一帧。
+            if best is None or meters < best.meters - 1e-9:
+                first, second = nearest_points(start_geometry, boundary)
+                best = PlaybackClearance(index, meters, body, first.coords[0], second.coords[0])
+    return best
 
 
 def _swept_inside_road(vgeoms, road_poly):
@@ -1000,7 +1061,7 @@ def run_right_angle_scene(bundle: InputBundle) -> SweepScenarioResult:
     tail = max(_ROAD_STRAIGHT, tangent_distance + max(_STRAIGHT + body_len, _departure_length(bundle)) + 3.0)
     road_poly = _road_right_angle(corner_xy, entry_w, exit_w, turn_deg,
                                   straight=tail, corner_radius=ra.corner_radius)
-    r_path, vgeoms, split, sweep_step = _ra_best_radius(
+    r_path, vgeoms, split, sweep_step, turn_frames = _ra_best_radius(
         bundle, turn_deg, road_poly, corner_xy, cands, width_limit, deltaW2)
 
     # —— 在选定半径下量测扫掠带 ——
@@ -1015,6 +1076,11 @@ def run_right_angle_scene(bundle: InputBundle) -> SweepScenarioResult:
     res.hydraulic = hydraulic
     res.travel_path = [(x, y) for x, y, *_ in vgeoms]
     res.playback_frames = vgeoms
+    res.playback_turn_frames = turn_frames
+    measurement_road = _road_right_angle(
+        corner_xy, entry_w, exit_w, turn_deg, corner_radius=ra.corner_radius,
+        straight=max(tail, _playback_road_length(bundle, max(entry_w, exit_w), tangent_distance)))
+    res.playback_clearance = _measure_playback_clearance(vgeoms, measurement_road)
     if bundle.cargo.width > bundle.trailer.width or bundle.cargo.length > bundle.trailer.length:
         res.cargo_sweep = split["cargo_sweep"]
     res.vehicle_overrun = split["vehicle_overrun"]

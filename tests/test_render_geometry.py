@@ -217,6 +217,26 @@ def test_all_annotations_inside_view_limits(factory):
         matplotlib.pyplot.close(fig)
 
 
+def test_playback_clearance_reports_the_most_exposed_body_and_frame():
+    from shapely.geometry import box
+
+    from app.core.passability import _measure_playback_clearance
+
+    road = box(0, 0, 20, 10)
+    deck = box(4, 7, 8, 8)
+    cargo_inside = box(5, 7.5, 7, 8.5)
+    cargo_outside = box(5, 8.5, 7, 10.3)
+    frames = [(6, 7.5, deck, deck, cargo_inside), (6, 8.5, deck, deck, cargo_outside)]
+    inside = _measure_playback_clearance(frames[:1], road)
+    assert inside.meters == pytest.approx(1.5)
+    assert inside.body == "货物"
+    outside = _measure_playback_clearance(frames, road)
+    assert outside.frame == 1 and outside.body == "货物"
+    assert outside.meters == pytest.approx(-0.3)
+    assert outside.body_point[1] == pytest.approx(10.3)
+    assert outside.road_point[1] == pytest.approx(10.0)
+
+
 def test_view_metrics_come_from_result_not_hardcoded():
     # 转弯圆心与仿真转角由计算层 metrics 提供，渲染层不再硬编码/引用私有常量
     res = run_scene(_hydraulic_arc_bundle())

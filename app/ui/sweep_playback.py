@@ -5,9 +5,11 @@ import time
 from bisect import bisect_left
 from itertools import accumulate
 
-from PyQt5.QtCore import QSignalBlocker, Qt, QTimer
+from PyQt5.QtCore import QPoint, QSignalBlocker, Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QColor, QPainter, QPen
 from PyQt5.QtWidgets import (QComboBox, QDialog, QDoubleSpinBox, QHBoxLayout,
-                             QLabel, QPushButton, QSlider, QVBoxLayout)
+                             QLabel, QPushButton, QSlider, QStyle, QStyleOptionSlider,
+                             QVBoxLayout)
 from shapely.geometry import Point
 
 from config import SIM_TURN_SPEED
@@ -16,8 +18,44 @@ from app.rendering.sweep_view import build_playback_figure, draw_overview_pose, 
 from .qtutil import _primary_screen_geometry
 
 
+class PlaybackSlider(QSlider):
+    markerClicked = pyqtSignal(str)
+
+    def __init__(self, markers):
+        super().__init__(Qt.Horizontal)
+        self.markers = markers
+        self.setMinimumHeight(30)
+
+    def _marker_positions(self):
+        option = QStyleOptionSlider()
+        self.initStyleOption(option)
+        for key, value, color, top in self.markers:
+            option.sliderPosition = option.sliderValue = value
+            handle = self.style().subControlRect(QStyle.CC_Slider, option, QStyle.SC_SliderHandle, self)
+            y = handle.top() - 4 if top else handle.bottom() + 4
+            yield key, QPoint(handle.center().x(), y), color
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        for _, position, color in self._marker_positions():
+            painter.setPen(QPen(QColor(color), 5, Qt.SolidLine, Qt.RoundCap))
+            painter.drawPoint(position)
+        painter.end()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            for key, position, _ in self._marker_positions():
+                if (event.pos() - position).manhattanLength() <= 4:
+                    self.markerClicked.emit(key)
+                    event.accept()
+                    return
+        super().mousePressEvent(event)
+
+
 class SweepPlaybackDialog(QDialog):
     _SLIDER_MAX = 10000
+    _TURN_COLOR = "#2b639d"
 
     def __init__(self, result, parent=None):
         super().__init__(parent)
@@ -34,24 +72,60 @@ class SweepPlaybackDialog(QDialog):
         self.duration = self.length / SIM_TURN_SPEED
         self.index = -1
         self.pose_artists = []
+        self.clearance = result.playback_clearance
+        self.clearance_color = "#ad332d" if self.clearance and self.clearance.meters < 0 else "#87570f"
+        self.events = dict(zip(("entry", "exit"), result.playback_turn_frames))
+        if self.clearance is not None:
+            self.events["minimum"] = self.clearance.frame
+        contact = right_angle_invasion(result)
+        if contact is not None:
+            body, _, location, _ = contact
+            point = Point(location)
+            self.events["invasion"] = min(range(len(self.frames)),
+                                          key=lambda i: self._invasion_distance(i, body, point))
         self.timer = QTimer(self)
         self.timer.setTimerType(Qt.PreciseTimer)
         self.timer.setInterval(33)
         self.timer.timeout.connect(self._advance)
         figure, self.axes = build_playback_figure(result)
         self.canvas = FigureCanvasQTAgg(figure)
+        self.canvas.setMinimumSize(640, 400)
         self._build_controls()
         self._show_frame(0)
 
     def _build_controls(self):
         layout = QVBoxLayout(self)
         layout.addWidget(self.canvas, 1)
-        self.progress = QSlider(Qt.Horizontal)
+        markers = [(key, self._progress_value(self.distances[index]),
+                    self.clearance_color if key == "minimum" else self._TURN_COLOR, key == "minimum")
+                   for key, index in self.events.items() if key != "invasion"]
+        self.progress = PlaybackSlider(markers)
         self.progress.setAccessibleName("行驶距离进度")
         self.progress.setRange(0, self._SLIDER_MAX)
         self.progress.setEnabled(self.length > 0)
         self.progress.valueChanged.connect(self._seek_distance)
+        self.progress.markerClicked.connect(self.seek_event)
         layout.addWidget(self.progress)
+
+        event_row = QHBoxLayout()
+        for key, title, detail in (("entry", "入弯", "仿真参考点开始转向"),
+                                   ("minimum", "最小间距", "全程最小间距所在姿态"),
+                                   ("exit", "出弯", "仿真参考点结束转向")):
+            if key in self.events:
+                color = self.clearance_color if key == "minimum" else self._TURN_COLOR
+                button = QPushButton(title)
+                button.setObjectName(f"Replay-{key}")
+                button.setStyleSheet(f"color: {color};")
+                button.setToolTip(f"{detail} · 行驶距离 {self.distances[self.events[key]]:.2f} m")
+                button.clicked.connect(lambda checked=False, target=key: self.seek_event(target))
+                event_row.addWidget(button)
+        event_row.addStretch()
+        if self.clearance is not None:
+            readout = QLabel(f"全程最小间距 {self.clearance.meters:.3f} m · {self.clearance.body}")
+            readout.setStyleSheet(f"color: {self.clearance_color};")
+            readout.setToolTip("逐帧量测车货外廓到路缘的水平间距，负值表示越界")
+            event_row.addWidget(readout)
+        layout.addLayout(event_row)
 
         row = QHBoxLayout()
         self.play = QPushButton("播放")
@@ -65,11 +139,10 @@ class SweepPlaybackDialog(QDialog):
         row.addWidget(self.previous)
         row.addWidget(self.next)
 
-        contact = right_angle_invasion(self.result)
-        if contact is not None:
+        if "invasion" in self.events:
             locate = QPushButton("定位侵入")
             locate.setToolTip("跳到离标记点最近的仿真姿态")
-            locate.clicked.connect(self._seek_invasion)
+            locate.clicked.connect(lambda: self.seek_event("invasion"))
             row.addWidget(locate)
         self.distance_label = QLabel()
         row.addWidget(self.distance_label, 1, Qt.AlignCenter)
@@ -94,6 +167,9 @@ class SweepPlaybackDialog(QDialog):
         for button in self.findChildren(QPushButton):
             button.setAutoDefault(False)
 
+    def _progress_value(self, distance):
+        return round(distance / self.length * self._SLIDER_MAX) if self.length else 0
+
     def _show_frame(self, index):
         if index == self.index:
             return
@@ -101,10 +177,14 @@ class SweepPlaybackDialog(QDialog):
         for artist in self.pose_artists:
             artist.remove()
         self.pose_artists = draw_overview_pose(self.axes, self.frames[index], self.result.hydraulic)
+        if self.clearance is not None and index == self.clearance.frame:
+            points = (self.clearance.body_point, self.clearance.road_point)
+            self.pose_artists += self.axes.plot(*zip(*points), color=self.clearance_color,
+                                                marker="o", mfc="white", ms=5, lw=2.0, zorder=13)
         distance = self.distances[index]
         with QSignalBlocker(self.progress), QSignalBlocker(self.seek_time):
             if not self.progress.isSliderDown():
-                self.progress.setValue(round(distance / self.length * self._SLIDER_MAX) if self.length else 0)
+                self.progress.setValue(self._progress_value(distance))
             self.seek_time.setValue(distance / SIM_TURN_SPEED)
         self.distance_label.setText(f"{distance:.2f} / {self.length:.2f} m")
         self.previous.setEnabled(index > 0)
@@ -160,15 +240,14 @@ class SweepPlaybackDialog(QDialog):
         if distance >= self.length:
             self._pause()
 
-    def _seek_invasion(self):
-        self._pause()
-        body, _, location, _ = right_angle_invasion(self.result)
-        point = Point(location)
-        # 侵入点取自连续扫掠面。有些点位于两帧之间，因此按最近的原始姿态定位。
-        index = min(range(len(self.frames)), key=lambda i: self._invasion_distance(i, body, point))
-        self._show_frame(index)
+    def seek_event(self, key):
+        """暂停并跳到原始采样帧，避免滑块舍入选到相邻姿态。"""
+        if key in self.events:
+            self._pause()
+            self._show_frame(self.events[key])
 
     def _invasion_distance(self, index, body, point):
+        # 侵入点来自连续扫掠面，可能在两帧之间。
         _, _, envelope, deck, cargo = self.frames[index][:5]
         if body == "cargo":
             return cargo.distance(point)

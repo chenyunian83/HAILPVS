@@ -127,10 +127,11 @@ class TractorTrailerKinematics:
 
 
 def run_profile(kin: TractorTrailerKinematics, profile, v=2.0, dt=0.05,
-                draw_step=1, max_steps=40000, include_boundaries=False):
+                draw_step=1, max_steps=40000, include_boundaries=False, phase_ends=None):
     """按转向角时序推演，每段可用 (count, delta_rad, dt) 指定自己的步长。
 
     返回 (frames, kin)。frames 为采样帧，每帧 (x,y,theta,tx,ty)。
+    phase_ends 可收集每段最后一个采样帧的索引；保留精确切换帧时启用 include_boundaries。
     """
     def pose():
         return kin.x, kin.y, kin.theta, kin.tx, kin.ty
@@ -152,6 +153,8 @@ def run_profile(kin: TractorTrailerKinematics, profile, v=2.0, dt=0.05,
                     frames.append(pose())
             elif (step - 1) % draw_step == 0:
                 frames.append(pose())
+        if phase_ends is not None:
+            phase_ends.append(len(frames) - 1)
     return frames, kin
 
 
@@ -466,7 +469,7 @@ def axle_steering_geoms(base_x, base_y, psi, trailer, rho,
 def hydraulic_arc_trajectory(bundle: InputBundle, b12, radius, turn_deg,
                              straight=6.0, dt=0.05, draw_step=8,
                              center=(0.0, 0.0), *, max_step=None,
-                             include_envelope=True, exit_straight=None):
+                             include_envelope=True, exit_straight=None, turn_frames=None):
     """液压轴线挂车专属刚性圆周轨迹（D5：行为区分可视化）。
 
     整车刚体绕转弯圆心 O 以 radius 为半径做匀速圆周运动（无铰接尾摆），
@@ -505,6 +508,8 @@ def hydraulic_arc_trajectory(bundle: InputBundle, b12, radius, turn_deg,
         cx, cy = R * math.cos(phi), R * math.sin(phi)
         psi = math.radians(90.0) + phi
         frames.append((cx, cy, psi, rho, (cx, cy)))
+    if turn_frames is not None:
+        turn_frames.extend((line_pts, line_pts + n))
     # 出弯直道：沿末端切向
     end_psi = math.radians(90.0) + turn_rad
     ex, ey = frames[-1][0], frames[-1][1]

@@ -48,7 +48,7 @@ try:
         log("login accepted")
         try:
             win = MainWindow()
-            win.showFullScreen()
+            win.showMaximized()
             log("MainWindow shown, entering event loop")
             code = app.exec_()
             log("event loop exited code=%s" % code)
